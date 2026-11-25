@@ -1,14 +1,19 @@
+import asyncio
 import io
 import os
+import re
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
 # -----------------------------------------------------------------------------
@@ -231,6 +236,79 @@ async def predict_fire(request: Request, file: Optional[UploadFile] = File(None)
         status_code=400,
         detail="No image uploaded. Provide an image in 'file' form field or as raw binary body.",
     )
+
+
+# -----------------------------------------------------------------------------
+# 4. BMKG Open Data & CAP Nowcast Proxy (Sawah Besar, Jakarta Pusat Support)
+# -----------------------------------------------------------------------------
+_BMKG_CACHE: dict[str, tuple[float, str, bytes]] = {}
+_ADM4_PATTERN = re.compile(r"^\d{2}\.\d{2}\.\d{2}\.\d{4}$")
+_CAP_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_-]{4,32}$")
+
+
+def _fetch_bmkg_upstream_sync(url: str, accept: str, max_bytes: int = 1024 * 1024) -> tuple[str, bytes]:
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": accept,
+            "User-Agent": "Agrapatha-Backend/1.0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(req, timeout=8.0) as resp:
+        content_type = resp.headers.get("Content-Type") or accept.split(",")[0].strip()
+        raw = resp.read(max_bytes + 1)
+        if len(raw) > max_bytes:
+            raise HTTPException(status_code=502, detail="BMKG upstream response exceeded maximum size limit.")
+        return content_type, raw
+
+
+async def _get_cached_bmkg(cache_key: str, url: str, accept: str, ttl_sec: int) -> Response:
+    now = time.monotonic()
+    cached = _BMKG_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < ttl_sec:
+        return Response(content=cached[2], media_type=cached[1], headers={"X-Cache": "HIT"})
+
+    try:
+        content_type, raw = await asyncio.to_thread(_fetch_bmkg_upstream_sync, url, accept)
+    except HTTPException:
+        raise
+    except urllib.error.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"BMKG upstream HTTP {e.code}")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"BMKG upstream unavailable: {e}")
+
+    if len(_BMKG_CACHE) > 64:
+        _BMKG_CACHE.clear()
+    _BMKG_CACHE[cache_key] = (now, content_type, raw)
+    return Response(content=raw, media_type=content_type, headers={"X-Cache": "MISS"})
+
+
+@app.get("/api/bmkg/forecast")
+async def proxy_bmkg_forecast(adm4: str = Query("31.71.02.1001")):
+    clean_adm4 = adm4.strip()
+    if not _ADM4_PATTERN.match(clean_adm4):
+        raise HTTPException(status_code=400, detail="Invalid adm4 code format. Expected XX.XX.XX.XXXX.")
+    target_url = f"https://api.bmkg.go.id/publik/prakiraan-cuaca?adm4={urllib.parse.quote(clean_adm4)}"
+    return await _get_cached_bmkg(f"fc:{clean_adm4}", target_url, "application/json", ttl_sec=300)
+
+
+@app.get("/api/bmkg/nowcast/{lang}")
+async def proxy_bmkg_nowcast_feed(lang: str):
+    if lang not in ("id", "en"):
+        raise HTTPException(status_code=400, detail="Language must be 'id' or 'en'.")
+    target_url = f"https://www.bmkg.go.id/alerts/nowcast/{lang}"
+    return await _get_cached_bmkg(f"nc:{lang}", target_url, "application/xml, application/rss+xml, text/xml", ttl_sec=180)
+
+
+@app.get("/api/bmkg/nowcast/{lang}/{cap_code}_alert.xml")
+async def proxy_bmkg_cap_detail(lang: str, cap_code: str):
+    if lang not in ("id", "en"):
+        raise HTTPException(status_code=400, detail="Language must be 'id' or 'en'.")
+    if not _CAP_CODE_PATTERN.match(cap_code):
+        raise HTTPException(status_code=400, detail="Invalid CAP detail code.")
+    target_url = f"https://www.bmkg.go.id/alerts/nowcast/{lang}/{cap_code}_alert.xml"
+    return await _get_cached_bmkg(f"cap:{lang}:{cap_code}", target_url, "application/xml, text/xml", ttl_sec=180)
 
 
 if __name__ == "__main__":
