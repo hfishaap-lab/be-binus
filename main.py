@@ -93,9 +93,32 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "X-Frame-Timestamp",
+        "X-Frame-Age-Seconds",
+        "X-Frame-Stale",
+        "X-Vision-Label",
+        "X-Vision-Confidence",
+        "X-Scan-Number",
+        "X-Capture-Fulfilled-Seq",
+    ],
 )
 
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB upload safety limit
+
+_LATEST_ESP32CAM_FRAME: dict[str, object] = {
+    "bytes": None,
+    "received_at_ms": 0,
+    "scan_number": None,
+    "predicted_label": None,
+    "confidence_pct": None,
+}
+_CAPTURE_TRIGGER_STATE: dict[str, object] = {
+    "seq": 0,
+    "fulfilled_seq": 0,
+    "pending": False,
+    "requested_at_ms": 0,
+}
 
 
 @app.get("/")
@@ -125,29 +148,42 @@ def read_health():
     }
 
 
-def process_inference(image_bytes: bytes) -> dict:
-    if interpreter is None or input_details is None or output_details is None:
-        raise HTTPException(
-            status_code=503,
-            detail=f"TFLite model is not ready. Error: {model_load_error}",
-        )
-
+def process_inference(
+    image_bytes: bytes,
+    save_esp32cam_frame: bool = False,
+    scan_number: Optional[int] = None,
+) -> dict:
     if len(image_bytes) > MAX_IMAGE_BYTES:
         raise HTTPException(
             status_code=413,
             detail="Image payload exceeds 10 MB maximum allowed size.",
         )
 
-    start_time = time.perf_counter()
-
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image = image.resize((224, 224), Image.Resampling.BILINEAR)
+        image_resized = image.resize((224, 224), Image.Resampling.BILINEAR)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image format: {e}")
 
+    now_ms = int(time.time() * 1000)
+
+    if save_esp32cam_frame:
+        _LATEST_ESP32CAM_FRAME["bytes"] = bytes(image_bytes)
+        _LATEST_ESP32CAM_FRAME["received_at_ms"] = now_ms
+        _LATEST_ESP32CAM_FRAME["scan_number"] = scan_number
+        _CAPTURE_TRIGGER_STATE["pending"] = False
+        _CAPTURE_TRIGGER_STATE["fulfilled_seq"] = _CAPTURE_TRIGGER_STATE["seq"]
+
+    if interpreter is None or input_details is None or output_details is None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"TFLite model is not ready. Error: {model_load_error}",
+        )
+
+    start_time = time.perf_counter()
+
     # MobileNetV2 preprocessing: (x / 127.5) - 1.0 -> range [-1.0, 1.0]
-    img_array = np.array(image, dtype=np.float32)
+    img_array = np.array(image_resized, dtype=np.float32)
     img_array = (img_array / 127.5) - 1.0
     input_tensor = np.expand_dims(img_array, axis=0)
 
@@ -166,6 +202,11 @@ def process_inference(image_bytes: bytes) -> dict:
     predicted_label = CLASSES_DISPLAY[predicted_idx]
     firmware_class = CLASSES_FIRMWARE[predicted_idx]
     confidence = float(output_tensor[predicted_idx])
+    conf_pct = round(confidence * 100.0, 2)
+
+    if save_esp32cam_frame:
+        _LATEST_ESP32CAM_FRAME["predicted_label"] = predicted_label
+        _LATEST_ESP32CAM_FRAME["confidence_pct"] = conf_pct
 
     dashboard_scores = {
         "Non-Fire": round(non_fire_score, 4),
@@ -190,7 +231,7 @@ def process_inference(image_bytes: bytes) -> dict:
     data_payload = {
         "predicted_label": predicted_label,
         "confidence": round(confidence, 4),
-        "confidence_percentage": round(confidence * 100.0, 2),
+        "confidence_percentage": conf_pct,
         "scores": dashboard_scores,
         "sorted_scores": sorted_scores,
         "output_type": "probability",
@@ -199,6 +240,9 @@ def process_inference(image_bytes: bytes) -> dict:
         "model_name": "MobileNetV2 (be-binus Railway)",
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+
+    req_at_ms = int(_CAPTURE_TRIGGER_STATE["requested_at_ms"])
+    still_pending = bool(_CAPTURE_TRIGGER_STATE["pending"]) and (now_ms - req_at_ms < 20000)
 
     return {
         "success": True,
@@ -213,29 +257,108 @@ def process_inference(image_bytes: bytes) -> dict:
         "scores": combined_scores,
         "inference_time_ms": data_payload["inference_time_ms"],
         "model_name": data_payload["model_name"],
+        "frame_cached": save_esp32cam_frame,
+        "capture_requested": still_pending,
     }
 
 
 @app.post("/api/v1/predict")
 @app.post("/predict/fire")
 @app.post("/predict")
-async def predict_fire(request: Request, file: Optional[UploadFile] = File(None)):
+async def predict_fire(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    source: Optional[str] = Query(None),
+    scan: Optional[int] = Query(None),
+):
+    ua = request.headers.get("user-agent", "")
+    cam_hdr = request.headers.get("x-camera-device", "")
+    is_esp32cam = (
+        (source or "").strip().lower() == "esp32cam"
+        or cam_hdr.strip().lower() == "esp32cam"
+        or ua.startswith("ESP32-CAM")
+    )
+
     # 1. Handle multipart/form-data upload
     if file is not None:
         contents = await file.read()
         if len(contents) == 0:
             raise HTTPException(status_code=400, detail="Empty file payload received.")
-        return process_inference(contents)
+        return process_inference(contents, save_esp32cam_frame=is_esp32cam, scan_number=scan)
 
     # 2. Fallback to raw binary body (common for lightweight microcontrollers like ESP32-CAM)
     body = await request.body()
     if len(body) > 0:
-        return process_inference(body)
+        return process_inference(body, save_esp32cam_frame=is_esp32cam, scan_number=scan)
 
     raise HTTPException(
         status_code=400,
         detail="No image uploaded. Provide an image in 'file' form field or as raw binary body.",
     )
+
+
+@app.post("/api/vision/capture-request")
+def request_esp32cam_capture():
+    now_ms = int(time.time() * 1000)
+    next_seq = int(_CAPTURE_TRIGGER_STATE["seq"]) + 1
+    _CAPTURE_TRIGGER_STATE["seq"] = next_seq
+    _CAPTURE_TRIGGER_STATE["pending"] = True
+    _CAPTURE_TRIGGER_STATE["requested_at_ms"] = now_ms
+    return {
+        "ok": True,
+        "seq": next_seq,
+        "pending": True,
+        "requested_at_ms": now_ms,
+    }
+
+
+@app.get("/api/vision/capture-status")
+def get_esp32cam_capture_status():
+    now_ms = int(time.time() * 1000)
+    req_at = int(_CAPTURE_TRIGGER_STATE["requested_at_ms"])
+    pending = bool(_CAPTURE_TRIGGER_STATE["pending"]) and (now_ms - req_at < 20000)
+    if not pending:
+        _CAPTURE_TRIGGER_STATE["pending"] = False
+    frame_bytes = _LATEST_ESP32CAM_FRAME["bytes"]
+    return {
+        "pending": pending,
+        "seq": _CAPTURE_TRIGGER_STATE["seq"],
+        "fulfilled_seq": _CAPTURE_TRIGGER_STATE["fulfilled_seq"],
+        "has_frame": frame_bytes is not None,
+        "frame_timestamp": _LATEST_ESP32CAM_FRAME["received_at_ms"] or None,
+        "scan_number": _LATEST_ESP32CAM_FRAME["scan_number"],
+    }
+
+
+@app.get("/api/vision/latest-frame.jpg")
+def get_latest_esp32cam_frame():
+    frame_bytes = _LATEST_ESP32CAM_FRAME["bytes"]
+    if not isinstance(frame_bytes, (bytes, bytearray)) or len(frame_bytes) == 0:
+        return Response(
+            status_code=204,
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
+
+    now_ms = int(time.time() * 1000)
+    received_ms = int(_LATEST_ESP32CAM_FRAME["received_at_ms"] or now_ms)
+    age_sec = max(0, (now_ms - received_ms) // 1000)
+    is_stale = "1" if age_sec > 20 else "0"
+
+    headers = {
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "X-Frame-Timestamp": str(received_ms),
+        "X-Frame-Age-Seconds": str(age_sec),
+        "X-Frame-Stale": is_stale,
+        "X-Capture-Fulfilled-Seq": str(_CAPTURE_TRIGGER_STATE["fulfilled_seq"]),
+    }
+    if _LATEST_ESP32CAM_FRAME["predicted_label"] is not None:
+        headers["X-Vision-Label"] = str(_LATEST_ESP32CAM_FRAME["predicted_label"])
+    if _LATEST_ESP32CAM_FRAME["confidence_pct"] is not None:
+        headers["X-Vision-Confidence"] = str(_LATEST_ESP32CAM_FRAME["confidence_pct"])
+    if _LATEST_ESP32CAM_FRAME["scan_number"] is not None:
+        headers["X-Scan-Number"] = str(_LATEST_ESP32CAM_FRAME["scan_number"])
+
+    return Response(content=bytes(frame_bytes), media_type="image/jpeg", headers=headers)
 
 
 # -----------------------------------------------------------------------------
